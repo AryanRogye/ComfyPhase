@@ -1,0 +1,227 @@
+import Metal
+import MetalKit
+import SwiftUI
+import AppKit
+
+/// A SwiftUI view that renders a Metal texture with aspect-fill scaling.
+public struct MetalImageView: NSViewRepresentable {
+    @Binding private var viewport: MetalImageViewport
+    private let texture: MTLTexture?
+    private let yCbCrTextures: YCbCrTextures?
+    
+    private var renderer: WallpaperShaderRenderer? = nil
+    private var reduceMotion = false
+
+    init(viewport: Binding<MetalImageViewport>, renderer: WallpaperShaderRenderer, reduceMotion: Bool) {
+        self._viewport = viewport
+        self.texture = renderer.backgroundTexture
+        self.yCbCrTextures = nil
+        self.renderer = renderer
+        self.reduceMotion = reduceMotion
+    }
+
+    private let context = MetalContext.shared
+    
+    /// Creates a Metal-backed image view.
+    ///
+    /// - Parameters:
+    ///   - viewport: The pan and zoom applied to the rendered texture.
+    ///   - texture: The texture to render, or `nil` when no image is available.
+    public init(
+        viewport: Binding<MetalImageViewport>,
+        texture: MTLTexture?
+    ) {
+        self._viewport = viewport
+        self.texture = texture
+        self.yCbCrTextures = nil
+    }
+
+    /// Creates a Metal-backed image view that renders bi-planar YCbCr textures.
+    ///
+    /// - Parameters:
+    ///   - viewport: The pan and zoom applied to the rendered texture.
+    ///   - texture: The luma and chroma textures to render.
+    public init(
+        viewport: Binding<MetalImageViewport>,
+        texture: YCbCrTextures
+    ) {
+        self._viewport = viewport
+        self.texture = nil
+        self.yCbCrTextures = texture
+    }
+    
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(context: context)
+    }
+    
+    public func makeNSView(context: Context) -> MTKView {
+        let view = MTKView()
+        view.device = self.context.device
+        view.colorPixelFormat = yCbCrTextures == nil ? .rgba16Float : .bgra8Unorm
+        view.colorspace = CGColorSpace(name: yCbCrTextures == nil
+            ? CGColorSpace.extendedLinearSRGB : CGColorSpace.sRGB)
+        view.delegate = context.coordinator
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        view.autoResizeDrawable = true
+        view.framebufferOnly = true
+        view.enableSetNeedsDisplay = false
+        view.isPaused = false
+        view.preferredFramesPerSecond = 60
+        // NSView-only: layer-backing isn't automatic like UIView.
+        view.wantsLayer = true
+        
+        context.coordinator.renderer = renderer
+        context.coordinator.reduceMotion = reduceMotion
+        context.coordinator.viewport = viewport
+        context.coordinator.texture = texture
+        context.coordinator.yCbCrTextures = yCbCrTextures
+        return view
+    }
+    
+    public func updateNSView(_ view: MTKView, context: Context) {
+        view.colorPixelFormat = yCbCrTextures == nil ? .rgba16Float : .bgra8Unorm
+        view.colorspace = CGColorSpace(name: yCbCrTextures == nil
+            ? CGColorSpace.extendedLinearSRGB : CGColorSpace.sRGB)
+        context.coordinator.renderer = renderer
+        context.coordinator.reduceMotion = reduceMotion
+        context.coordinator.viewport = viewport
+        context.coordinator.texture = texture
+        context.coordinator.yCbCrTextures = yCbCrTextures
+        view.draw()
+    }
+    
+    public final class Coordinator: NSObject, MTKViewDelegate {
+        fileprivate var renderer: WallpaperShaderRenderer?
+        fileprivate var reduceMotion = false
+        private let framesInFlight = DispatchSemaphore(value: 2)
+        fileprivate var viewport = MetalImageViewport()
+        fileprivate var texture: MTLTexture?
+        fileprivate var yCbCrTextures: YCbCrTextures?
+        
+        private let commandQueue: MTLCommandQueue
+        private let pipelineState: MTLRenderPipelineState
+        private let yCbCrPipelineState: MTLRenderPipelineState
+        private let vertexBuffer: MTLBuffer
+        
+        fileprivate init(context: MetalContext) {
+            commandQueue = context.queue
+            
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = context.library.makeFunction(
+                name: "snapCoreMetalImageVertexShader"
+            )
+            descriptor.fragmentFunction = context.library.makeFunction(
+                name: "snapCoreMetalImageFragmentShader"
+            )
+            descriptor.colorAttachments[0].pixelFormat = .rgba16Float
+            
+            guard let pipelineState = try? context.device.makeRenderPipelineState(
+                descriptor: descriptor
+            ) else {
+                fatalError("Failed to create the Metal image render pipeline.")
+            }
+            self.pipelineState = pipelineState
+
+            descriptor.fragmentFunction = context.library.makeFunction(
+                name: "snapCoreMetalImageYCbCrFragmentShader"
+            )
+            // The YCbCr shader already returns transfer-encoded video RGB.
+            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            guard let yCbCrPipelineState = try? context.device.makeRenderPipelineState(
+                descriptor: descriptor
+            ) else {
+                fatalError("Failed to create the YCbCr Metal image render pipeline.")
+            }
+            self.yCbCrPipelineState = yCbCrPipelineState
+            
+            let vertices: [Vertex] = [
+                .init(position: [-1, -1]),
+                .init(position: [-1, 1]),
+                .init(position: [1, 1]),
+                .init(position: [-1, -1]),
+                .init(position: [1, -1]),
+                .init(position: [1, 1]),
+            ]
+            
+            guard let vertexBuffer = context.device.makeBuffer(
+                bytes: vertices,
+                length: MemoryLayout<Vertex>.stride * vertices.count
+            ) else {
+                fatalError("Failed to create Metal image buffers.")
+            }
+            
+            self.vertexBuffer = vertexBuffer
+            super.init()
+        }
+        
+        public func draw(in view: MTKView) {
+            guard framesInFlight.wait(timeout: .now()) == .success else { return }
+            var submitted = false
+            defer { if !submitted { framesInFlight.signal() } }
+
+            guard let renderPassDescriptor = view.currentRenderPassDescriptor,
+                  let drawable = view.currentDrawable,
+                  texture != nil || yCbCrTextures != nil,
+                  view.drawableSize.height > 0,
+                  let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeRenderCommandEncoder(
+                    descriptor: renderPassDescriptor
+                  ) else {
+                return
+            }
+            
+            var shaderViewport = ShaderViewport(
+                origin: viewport.origin,
+                scale: viewport.scale,
+                viewAspect: Float(view.drawableSize.width / view.drawableSize.height)
+            )
+
+            encoder.setRenderPipelineState(
+                yCbCrTextures == nil ? pipelineState : yCbCrPipelineState
+            )
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&shaderViewport, length: MemoryLayout<ShaderViewport>.stride, index: 1)
+            if let yCbCrTextures {
+                encoder.setFragmentTexture(yCbCrTextures.yTexture, index: 0)
+                encoder.setFragmentTexture(yCbCrTextures.cbCrTexture, index: 1)
+                var isFullRange: UInt32 = yCbCrTextures.isFullRange ? 1 : 0
+                encoder.setFragmentBytes(
+                    &isFullRange,
+                    length: MemoryLayout<UInt32>.stride,
+                    index: 0
+                )
+            } else {
+                encoder.setFragmentTexture(texture, index: 0)
+            }
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            renderer?.encodeParticles(into: encoder, size: view.drawableSize,
+                scale: Float(view.window?.backingScaleFactor ?? 1), reduceMotion: reduceMotion)
+            encoder.endEncoding()
+            
+            let semaphore = framesInFlight
+            let retainedRenderer = renderer
+            commandBuffer.addCompletedHandler { _ in
+                _ = retainedRenderer
+                semaphore.signal()
+            }
+            submitted = true
+            commandBuffer.present(drawable)
+            commandBuffer.commit()
+        }
+        
+        public func mtkView(
+            _ view: MTKView,
+            drawableSizeWillChange size: CGSize
+        ) {}
+    }
+}
+
+private struct Vertex {
+    var position: SIMD2<Float>
+}
+
+private struct ShaderViewport {
+    var origin: SIMD2<Float>
+    var scale: Float
+    var viewAspect: Float
+}

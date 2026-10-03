@@ -10,4 +10,5 @@ import Foundation
 extension UserDefaults.Keys {
     static let wallpaperContainers = UserDefaults.Key<[WallpaperContainer]>("wallpaper_container", default: [])
     static let lastSelectedWallpaperContainer = UserDefaults.Key<UUID?>("last_selected_wallpaper_container", default: nil)
+    static let weatherMode = UserDefaults.Key<WeatherMode?>("weather_mode", default: nil)
 }

@@ -20,4 +20,9 @@ final class DefaultsManager {
             UserDefaults.standard[.wallpaperContainers] = wallpaperContainers
         }
     }
+    var weatherMode: WeatherMode? = UserDefaults.standard[.weatherMode] {
+        didSet {
+            UserDefaults.standard[.weatherMode] = weatherMode
+        }
+    }
 }

@@ -11,7 +11,7 @@ import UniformTypeIdentifiers
 @Observable
 @MainActor
 final class MenubarViewModel {
-    var isShowing: Bool = true
+    var isShowing: Bool = false
 
     var draftName: String = ""
     var draftLightImage: NSImage?
@@ -35,21 +35,26 @@ struct MenuBarRootView: View {
     var body: some View {
         if menubarVM.isShowing {
             VStack(alignment: .leading) {
-                if isCreatingConfiguration {
-                    configCreatorView
-                } else {
-                    header
-
-                    if defaultsManager.wallpaperContainers.isEmpty {
-                        emptyConfigView
+                VStack(alignment: .leading) {
+                    if isCreatingConfiguration {
+                        configCreatorView
                     } else {
-                        configView
+                        header
+
+                        if defaultsManager.wallpaperContainers.isEmpty {
+                            emptyConfigView
+                        } else {
+                            configView
+                        }
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                WeatherAnimationPicker(selection: $defaultsManager.weatherMode)
             }
             .padding(.vertical, 8)
             .padding(.horizontal, 4)
-            .frame(width: 300, height: 200, alignment: .topLeading)
+            .frame(width: 300, height: 300, alignment: .topLeading)
             .containerShape(.rect(cornerRadius: 12))
             .glassEffect(.regular, in: .rect(cornerRadius: 12))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -152,6 +157,40 @@ struct MenuBarRootView: View {
                 )
             }
         )
+    }
+}
+
+private struct WeatherAnimationPicker: View {
+    @Binding var selection: WeatherMode?
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Divider()
+
+            HStack {
+                Label("Animation", systemImage: "sparkles")
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Picker("Weather animation", selection: $selection) {
+                    Text("Off").tag(WeatherMode?.none)
+                    Label(WeatherMode.rain.title, systemImage: WeatherMode.rain.symbol)
+                        .tag(WeatherMode?.some(.rain))
+                    Label(WeatherMode.snow.title, systemImage: WeatherMode.snow.symbol)
+                        .tag(WeatherMode?.some(.snow))
+                    Label(WeatherMode.blossoms.title, systemImage: WeatherMode.blossoms.symbol)
+                        .tag(WeatherMode?.some(.blossoms))
+                    Label(WeatherMode.autumn.title, systemImage: WeatherMode.autumn.symbol)
+                        .tag(WeatherMode?.some(.autumn))
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .fixedSize()
+                .accessibilityLabel("Weather animation")
+            }
+            .padding(.horizontal, 4)
+        }
     }
 }
 
